@@ -25,11 +25,11 @@
           <label class="form-label" for="username">Username</label>
           <div class="input-icon">
             <i class="bi bi-person lead-icon"></i>
-            <input type="text" class="form-control <%= e.username ? 'is-invalid' : '' %>" id="username" name="username"
-                   value="<%= locals.username || '' %>" required minlength="3" maxlength="24"
-                   pattern="[A-Za-z0-9._\-]{3,24}" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+            <input type="text" class="form-control <%= e.username ? 'is-invalid' : '' %>" aria-describedby="usernameFeedback" id="username" name="username"
+                   value="<%= locals.username || '' %>" required minlength="6" maxlength="24"
+                   pattern="[A-Za-z0-9._\-]{6,24}" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
           </div>
-          <div class="invalid-feedback"><%= e.username || 'Use 3-24 letters, numbers, dots, underscores or hyphens.' %></div>
+          <div id="usernameFeedback" class="invalid-feedback"><%= e.username || 'Use 6-24 letters, numbers, dots, underscores or hyphens.' %></div>
         </div>
 
         <div class="mb-3">

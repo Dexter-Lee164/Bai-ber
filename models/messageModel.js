@@ -1,9 +1,4 @@
-/**
- * Message model: all SQL for the "messages" and "conversation_reads" tables.
- * Every function that changes a message also checks WHO is changing it
- * (sender_id = ?), so ownership is enforced inside the query itself.
- */
-const db = require('../database.js');
+const pool = require('../database.js');
 const { toIso } = require('./userModel');
 
 const MAX_LENGTH = 2000;
@@ -16,53 +11,10 @@ function toApi(row) {
     receiverId: row.receiver_id,
     content: row.content,
     sentAt: toIso(row.sent_at),
+    deleted: Boolean(row.deleted_at),
     editedAt: toIso(row.edited_at),
   };
 }
-
-const stmts = {
-  insert: db.prepare('INSERT INTO messages (sender_id, receiver_id, content) VALUES (?, ?, ?)'),
-  findById: db.prepare('SELECT * FROM messages WHERE message_id = ?'),
-  update: db.prepare(
-    'UPDATE messages SET content = ?, edited_at = CURRENT_TIMESTAMP WHERE message_id = ? AND sender_id = ?'
-  ),
-  remove: db.prepare('DELETE FROM messages WHERE message_id = ? AND sender_id = ?'),
-  history: db.prepare(`
-    SELECT * FROM (
-      SELECT * FROM messages
-      WHERE ((sender_id = @a AND receiver_id = @b) OR (sender_id = @b AND receiver_id = @a))
-        AND (@before IS NULL OR message_id < @before)
-      ORDER BY message_id DESC
-      LIMIT @limit
-    ) ORDER BY message_id ASC
-  `),
-  conversations: db.prepare(`
-    WITH convo AS (
-      SELECT CASE WHEN sender_id = @me THEN receiver_id ELSE sender_id END AS peer_id,
-             MAX(message_id) AS last_id
-      FROM messages
-      WHERE sender_id = @me OR receiver_id = @me
-      GROUP BY peer_id
-    )
-    SELECT c.peer_id, u.username, u.status,
-           m.message_id, m.sender_id, m.receiver_id, m.content, m.sent_at, m.edited_at,
-           (SELECT COUNT(*) FROM messages x
-             WHERE x.sender_id = c.peer_id AND x.receiver_id = @me
-               AND x.message_id > COALESCE(
-                 (SELECT r.last_read_id FROM conversation_reads r
-                   WHERE r.user_id = @me AND r.peer_id = c.peer_id), 0)
-           ) AS unread
-    FROM convo c
-    JOIN users    u ON u.user_id = c.peer_id
-    JOIN messages m ON m.message_id = c.last_id
-    ORDER BY c.last_id DESC
-  `),
-  markRead: db.prepare(`
-    INSERT INTO conversation_reads (user_id, peer_id, last_read_id)
-    VALUES (@me, @peer, (SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE sender_id = @peer AND receiver_id = @me))
-    ON CONFLICT(user_id, peer_id) DO UPDATE SET last_read_id = excluded.last_read_id
-  `),
-};
 
 module.exports = {
   MAX_LENGTH,
@@ -81,49 +33,65 @@ module.exports = {
     return { ok: true, content };
   },
 
-  create(senderId, receiverId, content) {
-    const info = stmts.insert.run(senderId, receiverId, content);
-    return toApi(stmts.findById.get(info.lastInsertRowid));
+  async findById(id) {
+    const [rows] = await pool.execute('SELECT * FROM messages WHERE message_id = ?', [id]);
+    return toApi(rows[0]);
   },
 
-  findById(id) {
-    return toApi(stmts.findById.get(id));
+  async create(sender, receiver, content) {
+    // Check friendship in the INSERT so a removed friendship cannot authorize a later write.
+    const [result] = await pool.execute(`INSERT INTO messages (sender_id, receiver_id, content, sent_at)
+      SELECT ?, ?, ?, UTC_TIMESTAMP() FROM friendships
+      WHERE active_low = LEAST(?, ?) AND active_high = GREATEST(?, ?) AND status = 'accepted'`,
+      [sender, receiver, content, sender, receiver, sender, receiver]);
+    return result.affectedRows ? this.findById(result.insertId) : null;
   },
 
-  /** Returns the edited message, or null when the message does not exist or is not owned by senderId. */
-  update(messageId, senderId, content) {
-    const info = stmts.update.run(content, messageId, senderId);
-    return info.changes ? toApi(stmts.findById.get(messageId)) : null;
+  async update(id, sender, content) {
+    const [result] = await pool.execute(`UPDATE messages SET content = ?, edited_at = UTC_TIMESTAMP()
+      WHERE message_id = ? AND sender_id = ? AND deleted_at IS NULL`, [content, id, sender]);
+    return result.affectedRows ? this.findById(id) : null;
   },
 
-  /** Returns true when a message owned by senderId was deleted. */
-  remove(messageId, senderId) {
-    return stmts.remove.run(messageId, senderId).changes > 0;
+  async remove(id, sender) {
+    const [result] = await pool.execute(`UPDATE messages SET content = 'Message deleted', deleted_at = UTC_TIMESTAMP(), edited_at = NULL
+      WHERE message_id = ? AND sender_id = ? AND deleted_at IS NULL`, [id, sender]);
+    return result.affectedRows;
   },
 
-  /**
-   * Messages between exactly two users, oldest first.
-   * Pass `before` (a message id) to load an earlier page.
-   */
-  history(userId, peerId, { before = null, limit = 50 } = {}) {
-    const rows = stmts.history.all({ a: userId, b: peerId, before, limit: limit + 1 });
-    // We asked for one extra row: if it exists there are older messages left to load.
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(1) : rows;
-    return { messages: page.map(toApi), hasMore };
+  async history(me, peer, {before, limit}) {
+    const [rows] = await pool.execute(`SELECT * FROM messages WHERE
+      ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+      AND (? IS NULL OR message_id < ?) ORDER BY message_id DESC LIMIT ?`,
+      [me, peer, peer, me, before, before, String(limit + 1)]);
+    return {messages: rows.slice(0, limit).reverse().map(toApi), hasMore: rows.length > limit};
   },
 
-  /** One entry per person the user has talked to, newest conversation first. */
-  conversationsFor(userId) {
-    return stmts.conversations.all({ me: userId }).map((row) => ({
-      peer: { id: row.peer_id, username: row.username, status: row.status },
-      lastMessage: toApi(row),
-      unread: row.unread,
+  async conversationsFor(me) {
+    const [rows] = await pool.execute(`WITH latest AS (
+      SELECT IF(sender_id = ?, receiver_id, sender_id) AS peer_id, MAX(message_id) AS last_id
+      FROM messages WHERE sender_id = ? OR receiver_id = ? GROUP BY peer_id)
+      SELECT m.*, u.user_id, u.username, u.status, u.legacy_admin,
+        (SELECT COUNT(*) FROM messages x WHERE x.sender_id = u.user_id AND x.receiver_id = ?
+          AND x.message_id > COALESCE(r.last_read_id, 0)) AS unread
+      FROM latest JOIN messages m ON m.message_id = latest.last_id JOIN users u ON u.user_id = latest.peer_id
+      LEFT JOIN conversation_reads r ON r.user_id = ? AND r.peer_id = u.user_id ORDER BY latest.last_id DESC`,
+      [me, me, me, me, me]);
+    return rows.map(row => ({
+      peer: {id: row.user_id, username: row.username, status: row.legacy_admin ? 'inactive' : row.status},
+      lastMessage: toApi(row), unread: Number(row.unread)
     }));
   },
 
-  /** Marks everything the peer has sent to the user so far as read. */
-  markRead(userId, peerId) {
-    stmts.markRead.run({ me: userId, peer: peerId });
+  async readPosition(me, peer) {
+    const [rows] = await pool.execute('SELECT last_read_id FROM conversation_reads WHERE user_id = ? AND peer_id = ?', [me, peer]);
+    return rows[0]?.last_read_id || 0;
   },
+
+  async markRead(me, peer, id) {
+    const [result] = await pool.execute(`INSERT INTO conversation_reads (user_id, peer_id, last_read_id)
+      SELECT ?, ?, message_id FROM messages WHERE message_id = ? AND sender_id = ? AND receiver_id = ?
+      ON DUPLICATE KEY UPDATE last_read_id = GREATEST(last_read_id, ?)`, [me, peer, id, peer, me, id]);
+    return result.affectedRows;
+  }
 };

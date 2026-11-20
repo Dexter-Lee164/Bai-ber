@@ -4,7 +4,7 @@
  * How it fits together:
  *   - REST (fetch) READS data:  conversations, friends, people search, message history.
  *   - REST (fetch) also CHANGES friendships: send / accept / decline / cancel requests.
- *   - Socket.IO SENDS and RECEIVES: send / edit / delete messages, plus live message and friendship updates.
+ *   - HTTP creates, edits and deletes messages. Socket.IO carries notifications and read receipts.
  *   - Messaging needs an accepted friendship. The server enforces it; this page only mirrors it
  *     (read-only conversation, disabled composer, contextual Add / Accept / Cancel buttons).
  *   - The chat list has an All / Unread filter built on the unread counts the server already sends.
@@ -143,18 +143,6 @@
   const socket = window.io({ reconnectionDelayMax: 5000 });
   let hasConnectedBefore = false;
 
-  /** Sends a socket event and waits for the server's answer (which only comes AFTER it saved to the database). */
-  function request(event, payload) {
-    return new Promise((resolve, reject) => {
-      if (!socket.connected) return reject(new Error("You're offline. Reconnecting, please try again in a moment."));
-      return socket.timeout(8000).emit(event, payload, (timeoutError, response) => {
-        if (timeoutError) return reject(new Error('The server took too long to answer. Please try again.'));
-        if (!response || !response.ok) return reject(new Error((response && response.error) || 'Something went wrong.'));
-        return resolve(response);
-      });
-    });
-  }
-
   /* ------------------------------------------------------------------
      Avatars
      ------------------------------------------------------------------ */
@@ -246,6 +234,7 @@
       case 'friends': {
         const actions = [smallBtn('Message', 'bi-chat-dots-fill', 'btn-soft', () => messageFriend(user), opts)];
         if (where === 'find') actions.unshift(el('span', { class: 'chip chip-friends' }, el('i', { class: 'bi bi-check2' }), 'Friends'));
+        actions.push(smallBtn('Unfriend', null, 'btn-outline-secondary', () => unfriend(relation.requestId, user), opts));
         return actions;
       }
       case 'incoming':
@@ -604,6 +593,7 @@
     if (!(options && options.keepQuery)) clearQuery();
     els.friendSeg.hidden = tab !== 'friends';
     els.chatFilter.hidden = tab !== 'chats';
+    if (tab === 'chats') markReadIfVisible();
 
     // The header button starts a new chat on the Chats tab and finds people on the Friends tab.
     const onFriends = tab === 'friends';
@@ -672,6 +662,14 @@
       accept ? `You and ${user.username} are now friends.` : `Friend request from ${user.username} declined.`);
   }
 
+  async function unfriend(id, user) {
+    if (await confirmDialog({ title: 'Unfriend ' + user.username + '?', user,
+      text: 'Your chat history will stay visible. Add each other again to send new messages.',
+      confirmLabel: 'Unfriend', keepLabel: 'Keep friend' })) {
+      await friendAction(user, () => api('/api/friends/' + id, { method: 'DELETE' }), 'Friend removed.');
+    }
+  }
+
   async function confirmCancelRequest(requestId, user) {
     const ok = await confirmDialog({
       title: 'Cancel friend request?',
@@ -730,9 +728,10 @@
           title: fullFmt.format(new Date(message.sentAt)),
           text: timeFmt.format(new Date(message.sentAt)),
         })));
+    if (mine && message.id === state.seenThrough) bubble.append(el('small', { class: 'seen-label', text: 'Seen' }));
     const wrap = el('div', { class: 'bubble-wrap' }, bubble);
 
-    if (mine) {
+    if (mine && !message.deleted) {
       wrap.append(el('button', {
         type: 'button',
         class: 'msg-menu-btn',
@@ -743,7 +742,7 @@
     }
 
     const row = el('div', { class: `msg ${mine ? 'out' : 'in'}${first ? ' first' : ''}`, dataset: { id: String(message.id) } }, wrap);
-    if (mine) {
+    if (mine && !message.deleted) {
       row.addEventListener('contextmenu', (event) => {
         event.preventDefault();
         openMenu(message, null, event);
@@ -796,6 +795,8 @@
 
   async function openConversation(peer) {
     const token = ++state.loadToken;
+    state.seenThrough = 0;
+    state.reportedRead = 0;
     state.peer = {
       id: peer.id,
       username: peer.username,
@@ -828,6 +829,8 @@
       const data = await api(`/api/messages/${peerId}`);
       if (token !== state.loadToken) return;
       state.peer = { id: data.peer.id, username: data.peer.username, status: data.peer.status, relation: data.relation };
+      state.seenThrough = Math.max(state.seenThrough, data.seenThrough);
+      state.reportedRead = 0;
       state.messages = data.messages;
       state.hasMore = data.hasMore;
       state.loadingMessages = false;
@@ -878,7 +881,7 @@
      ------------------------------------------------------------------ */
   function chatVisible() {
     const listOnly = mobileQuery.matches && app.classList.contains('view-list');
-    return Boolean(state.peer) && !listOnly && document.visibilityState === 'visible' && document.hasFocus();
+    return Boolean(state.peer) && state.tab === 'chats' && !listOnly && document.visibilityState === 'visible' && document.hasFocus();
   }
 
   /**
@@ -888,13 +891,21 @@
    */
   function markReadIfVisible() {
     if (!chatVisible() || !socket.connected) return;
-    const convo = state.conversations.find((c) => c.peer.id === state.peer.id);
-    if (convo && convo.unread) {
-      convo.unread = 0;
-      renderPanel();
-      updateUnreadIndicators();
+    if (state.loadingMessages) return;
+    const bounds = els.messages.getBoundingClientRect();
+    const rows = els.messages.querySelectorAll('.msg.in');
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const id = Number(rows[i].dataset.id);
+      if (id <= state.reportedRead) return;
+      const row = rows[i].getBoundingClientRect();
+      if (row.top >= bounds.bottom || row.bottom <= bounds.top) continue;
+      state.reportedRead = id;
+      const peerId = state.peer.id;
+      socket.emit('conversation:read', { peerId, messageId: id }, reply => {
+        if (!reply?.ok && state.peer?.id === peerId && state.reportedRead === id) state.reportedRead = 0;
+      });
+      return;
     }
-    socket.emit('conversation:read', { peerId: state.peer.id });
   }
 
   /* ------------------------------------------------------------------
@@ -922,13 +933,13 @@
   }
 
   function applyDeleted(id) {
-    const before = state.messages.length;
-    state.messages = state.messages.filter((m) => m.id !== id);
+    const message = state.messages.find(m => m.id === id);
+    if (message) Object.assign(message, { content: 'Message deleted', editedAt: null, deleted: true });
     if (state.editingId === id) {
       cancelEdit();
       toast('The message you were editing was deleted.', 'info');
     }
-    if (state.messages.length !== before) renderMessages('keep');
+    if (message) renderMessages('keep');
     scheduleRefresh();
   }
 
@@ -975,14 +986,13 @@
   socket.on('message:edited', applyEdited);
   socket.on('message:deleted', ({ id }) => applyDeleted(id));
 
-  socket.on('conversation:read', ({ peerId }) => {
-    const convo = state.conversations.find((c) => c.peer.id === peerId);
-    if (convo) {
-      convo.unread = 0;
-      renderPanel();
-      updateUnreadIndicators();
+  socket.on('conversation:seen', ({ peerId, messageId }) => {
+    if (state.peer?.id === peerId && messageId > state.seenThrough) {
+      state.seenThrough = messageId;
+      renderMessages('keep');
     }
   });
+  socket.on('conversation:read', scheduleRefresh);
 
   /*
    * Friendship changes. The server sends each person the OTHER user plus the new relation from
@@ -1003,7 +1013,7 @@
     };
   }
 
-  ['friend:request', 'friend:accepted', 'friend:declined', 'friend:cancelled']
+  ['friend:request', 'friend:accepted', 'friend:declined', 'friend:cancelled', 'friend:removed']
     .forEach((event) => socket.on(event, onFriendEvent(event)));
   socket.on('friends:updated', scheduleFriendsRefresh);
 
@@ -1128,11 +1138,11 @@
     updateSendState();
     try {
       if (state.editingId !== null) {
-        const result = await request('message:edit', { messageId: state.editingId, content });
+        const result = await api('/api/messages/' + state.editingId, { method: 'PUT', body: {content} });
         applyEdited(result.message);
         cancelEdit();
       } else {
-        const result = await request('message:send', { recipientId: state.peer.id, content });
+        const result = await api('/api/messages', { method: 'POST', body: {recipientId: state.peer.id, content} });
         if (els.composerInput.value.trim() === content) {
           els.composerInput.value = '';
           autosize();
@@ -1244,7 +1254,7 @@
     if (id === null) return;
     confirmDeleteBtn.disabled = true;
     try {
-      await request('message:delete', { messageId: id });
+      await api('/api/messages/' + id, { method: 'DELETE' });
       applyDeleted(id);
     } catch (err) {
       toast(err.message, 'error');
@@ -1299,6 +1309,39 @@
     newPassword: { input: $('pwNew'), error: $('pwNewError') },
     confirmPassword: { input: $('pwConfirm'), error: $('pwConfirmError') },
   };
+
+  const usernameInput = $('profileUsername');
+  function updateOwnName(username) {
+    ME.username = username;
+    app.dataset.meUsername = username;
+    usernameInput.value = username;
+    document.querySelector('.profile-name').textContent = username;
+    document.querySelector('#chatEmpty h2').textContent = 'Welcome to Bai-ber, ' + username;
+    $('railAvatar').title = username;
+    $('railAvatar').setAttribute('aria-label', 'Your profile (' + username + ')');
+    document.querySelectorAll('#railAvatar .avatar, .profile-card .avatar').forEach(a => a.textContent = username.charAt(0));
+  }
+  socket.on('profile:renamed', ({ id, username }) => {
+    if (id === ME.id) updateOwnName(username);
+    if (state.peer?.id === id) { state.peer.username = username; renderHeader(); updateComposerState(); }
+    scheduleRefresh();
+    scheduleFriendsRefresh();
+  });
+  usernameInput.addEventListener('input', () => usernameInput.classList.remove('is-invalid'));
+  $('usernameForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const username = usernameInput.value.trim();
+    try {
+      if (username !== ME.username && username.length < 6) throw new Error('Username must be at least 6 characters.');
+      const data = await api('/api/profile/username', { method: 'POST', body: { username } });
+      updateOwnName(data.username);
+      usernameInput.classList.remove('is-invalid');
+      toast('Username saved.', 'success');
+    } catch (err) {
+      $('renameError').textContent = err.message;
+      usernameInput.classList.add('is-invalid');
+    }
+  });
 
   function resetPasswordForm() {
     $('passwordForm').reset();
@@ -1373,8 +1416,6 @@
   });
   $('emptyStartBtn').addEventListener('click', startNewConversation);
   $('backBtn').addEventListener('click', () => setView('list'));
-  $('closeChatBtn').addEventListener('click', closeConversation);
-  $('reloadBtn').addEventListener('click', () => { if (state.peer) openConversation(state.peer); });
 
   els.searchInput.addEventListener('input', onSearchInput);
   els.searchInput.addEventListener('keydown', (event) => {
@@ -1389,6 +1430,7 @@
     els.searchInput.focus();
   });
 
+  els.messages.addEventListener('scroll', markReadIfVisible, { passive: true });
   window.addEventListener('focus', markReadIfVisible);
   document.addEventListener('visibilitychange', markReadIfVisible);
 

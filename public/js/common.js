@@ -109,6 +109,8 @@
     document.querySelectorAll('form.needs-validation').forEach(function (form) {
       var confirmInput = form.querySelector('[data-match]');
       form.addEventListener('submit', function (event) {
+        var username = form.querySelector('#username[minlength]');
+        if (username) username.value = username.value.trim();
         if (confirmInput) {
           var original = document.getElementById(confirmInput.getAttribute('data-match'));
           confirmInput.setCustomValidity(original && confirmInput.value !== original.value ? 'Passwords do not match.' : '');

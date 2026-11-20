@@ -89,15 +89,6 @@
           <div class="head-name" id="headName"></div>
           <div class="head-status" id="headStatus"></div>
         </div>
-        <div class="dropdown">
-          <button type="button" class="icon-btn plain" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Conversation options">
-            <i class="bi bi-three-dots-vertical"></i>
-          </button>
-          <ul class="dropdown-menu dropdown-menu-end bb-dropdown">
-            <li><button type="button" class="dropdown-item" id="reloadBtn"><i class="bi bi-arrow-clockwise"></i>Reload messages</button></li>
-            <li><button type="button" class="dropdown-item" id="closeChatBtn"><i class="bi bi-x-lg"></i>Close conversation</button></li>
-          </ul>
-        </div>
       </header>
 
       <div class="messages" id="messages" tabindex="0" aria-label="Messages" aria-live="polite"></div>
@@ -140,6 +131,14 @@
             <div class="profile-sub">Member since <time datetime="<%= me.createdAt %>" data-local="date"><%= formatUtc(me.createdAt) %></time></div>
           </div>
         </div>
+
+        <form id="usernameForm" class="mb-4" novalidate>
+          <label class="form-label" for="profileUsername">Username</label>
+          <input class="form-control" id="profileUsername" value="<%= me.username %>" maxlength="24"
+                 autocomplete="username" aria-describedby="renameError" required>
+          <div class="invalid-feedback" id="renameError" role="alert"></div>
+          <button class="btn btn-primary btn-sm mt-2" type="submit">Save username</button>
+        </form>
 
         <h3 class="profile-section">Change password</h3>
         <form id="passwordForm" novalidate>

@@ -1,36 +1,11 @@
-/**
- * User model: accounts, people search, friend requests and the friendship check.
- * Every SQL statement for the "users", "friendships" and (per-user) "sessions" rows lives here.
- * All queries are parameterized (?, @name) so user input is never pasted into SQL.
- *
- * Friend requests: one row in "friendships" per request. Status lifecycle:
- *   pending -> accepted | declined | cancelled
- * Only pending and accepted rows are "active". The unique index uq_friendships_active_pair
- * (database.js) allows ONE active row per pair of people, whoever sent it, so the queries
- * below normalise the pair with MIN()/MAX() exactly like the index does.
- * Every state change names WHO may make it inside the UPDATE itself (receiver_id = ? for
- * accept/decline, sender_id = ? for cancel), so a forged request id can never change
- * someone else's request.
- */
-const db = require('../database.js');
+const pool = require('../database');
 
-const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,24}$/;
+const USERNAME_PATTERN = /^[A-Za-z0-9._-]{6,24}$/;
 const PASSWORD_MIN = 8;
 const PASSWORD_MAX_BYTES = 72; // bcrypt ignores everything after 72 bytes
 
-/*
- * Legacy admin accounts. Bai-ber has one role, so fresh databases have no "role" column.
- * A database created by the older admin version still has it (we never rebuild that table),
- * and any row there with role = 'admin' is a legacy admin account: it cannot sign in and
- * never appears in friend search. Its old messages are kept.
- */
-const HAS_LEGACY_ROLE = Boolean(
-  db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'role'").get()
-);
-const NOT_LEGACY_ADMIN = HAS_LEGACY_ROLE ? "AND role <> 'admin'" : '';
-
 function isLegacyAdmin(row) {
-  return Boolean(row) && row.role === 'admin';
+  return Boolean(row) && Boolean(row.legacy_admin);
 }
 
 /** The one rule for "may this account use Bai-ber right now?" (login, every request, every socket event). */
@@ -38,7 +13,7 @@ function canUseApp(row) {
   return Boolean(row) && row.status === 'active' && !isLegacyAdmin(row);
 }
 
-/** SQLite stores CURRENT_TIMESTAMP as "YYYY-MM-DD HH:MM:SS" in UTC. Turn it into ISO-8601. */
+/** The database stores UTC timestamps as "YYYY-MM-DD HH:MM:SS" in UTC. Turn it into ISO-8601. */
 function toIso(value) {
   return value ? `${String(value).replace(' ', 'T')}Z` : null;
 }
@@ -76,97 +51,14 @@ function toFriendEntry(row) {
   };
 }
 
-const PAIR = 'MIN(sender_id, receiver_id) = MIN(@a, @b) AND MAX(sender_id, receiver_id) = MAX(@a, @b)';
-
-const stmts = {
-  // ---- accounts ----
-  findById: db.prepare('SELECT * FROM users WHERE user_id = ?'),
-  findByUsername: db.prepare('SELECT * FROM users WHERE username = ?'), // column is NOCASE
-  // No role is stored: on a legacy database the old column falls back to its default, 'user'.
-  insert: db.prepare(
-    "INSERT INTO users (username, password_hash, status) VALUES (@username, @passwordHash, 'active')"
-  ),
-  updatePassword: db.prepare('UPDATE users SET password_hash = ? WHERE user_id = ?'),
-  legacyAdminIds: HAS_LEGACY_ROLE ? db.prepare("SELECT user_id FROM users WHERE role = 'admin'") : null,
-  search: db.prepare(`
-    SELECT * FROM users
-    WHERE status = 'active' AND user_id <> @me ${NOT_LEGACY_ADMIN}
-      AND (@q = '' OR username LIKE @pattern ESCAPE '\\')
-    ORDER BY username COLLATE NOCASE ASC
-    LIMIT @limit
-  `),
-  // Sign a user out of every OTHER login session (used after a password change).
-  deleteOtherSessions: db.prepare('DELETE FROM sessions WHERE user_id = ? AND sid <> ?'),
-
-  // ---- friend requests / friendships ----
-  requestById: db.prepare('SELECT * FROM friendships WHERE friendship_id = ?'),
-  activeBetween: db.prepare(`
-    SELECT * FROM friendships
-    WHERE ${PAIR} AND status IN ('pending', 'accepted')
-  `),
-  activeFor: db.prepare(`
-    SELECT * FROM friendships
-    WHERE (sender_id = @me OR receiver_id = @me) AND status IN ('pending', 'accepted')
-  `),
-  insertRequest: db.prepare("INSERT INTO friendships (sender_id, receiver_id, status) VALUES (?, ?, 'pending')"),
-  respond: db.prepare(`
-    UPDATE friendships SET status = @status, updated_at = CURRENT_TIMESTAMP
-    WHERE friendship_id = @id AND receiver_id = @me AND status = 'pending'
-  `),
-  cancel: db.prepare(`
-    UPDATE friendships SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
-    WHERE friendship_id = @id AND sender_id = @me AND status = 'pending'
-  `),
-  friends: db.prepare(`
-    SELECT f.friendship_id, f.updated_at, u.user_id, u.username, u.status
-    FROM friendships f
-    JOIN users u ON u.user_id = CASE WHEN f.sender_id = @me THEN f.receiver_id ELSE f.sender_id END
-    WHERE (f.sender_id = @me OR f.receiver_id = @me) AND f.status = 'accepted'
-    ORDER BY u.username COLLATE NOCASE ASC
-  `),
-  incoming: db.prepare(`
-    SELECT f.friendship_id, f.updated_at, u.user_id, u.username, u.status
-    FROM friendships f JOIN users u ON u.user_id = f.sender_id
-    WHERE f.receiver_id = @me AND f.status = 'pending' AND u.status = 'active'
-    ORDER BY f.friendship_id DESC
-  `),
-  outgoing: db.prepare(`
-    SELECT f.friendship_id, f.updated_at, u.user_id, u.username, u.status
-    FROM friendships f JOIN users u ON u.user_id = f.receiver_id
-    WHERE f.sender_id = @me AND f.status = 'pending' AND u.status = 'active'
-    ORDER BY f.friendship_id DESC
-  `),
-};
-
-/**
- * Sends a request. One transaction, so the "is there already something between us?"
- * check and the insert cannot be split by another request.
- */
-const sendRequestTx = db.transaction((senderId, receiverId) => {
-  const existing = stmts.activeBetween.get({ a: senderId, b: receiverId });
-  if (existing) return { ok: false, relation: relationFrom(senderId, existing) };
-  const info = stmts.insertRequest.run(senderId, receiverId);
-  return { ok: true, request: stmts.requestById.get(info.lastInsertRowid) };
-});
-
+const activePair = 'active_low = LEAST(?, ?) AND active_high = GREATEST(?, ?)';
 module.exports = {
-  USERNAME_PATTERN,
-  PASSWORD_MIN,
-  PASSWORD_MAX_BYTES,
-  HAS_LEGACY_ROLE,
-  toIso,
-  toPublic,
-  isLegacyAdmin,
-  canUseApp,
-  relationFrom,
-
-  /* ---------------------------------------------------------------- accounts */
-
-  /** Returns an error message, or null when the username is acceptable. */
+  toIso, toPublic, isLegacyAdmin, canUseApp, relationFrom,
   validateUsername(username) {
     if (typeof username !== 'string' || !username.trim()) return 'Username is required.';
+    if (username.trim().length < 6) return "Username must be at least 6 characters.";
     if (!USERNAME_PATTERN.test(username.trim())) {
-      return 'Username must be 3-24 characters: letters, numbers, dots, underscores or hyphens.';
+      return 'Username must be 6-24 characters: letters, numbers, dots, underscores or hyphens.';
     }
     return null;
   },
@@ -181,100 +73,80 @@ module.exports = {
     return null;
   },
 
-  findById(id) {
-    return stmts.findById.get(id) || null;
+  async findById(id) {
+    const [rows] = await pool.execute('SELECT * FROM users WHERE user_id = ?', [id]);
+    return rows[0];
   },
-
-  findByUsername(username) {
-    return stmts.findByUsername.get(String(username)) || null;
+  async findByUsername(username) {
+    const [rows] = await pool.execute('SELECT * FROM users WHERE username = ?', [username]);
+    return rows[0];
   },
-
-  /** Creates an active, regular account. Throws SQLITE_CONSTRAINT_UNIQUE if the username exists. */
-  create({ username, passwordHash }) {
-    const info = stmts.insert.run({ username, passwordHash });
-    return stmts.findById.get(info.lastInsertRowid);
+  async create({username, passwordHash}) {
+    await pool.execute('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, UTC_TIMESTAMP())', [username, passwordHash]);
   },
-
-  setPassword(id, passwordHash) {
-    stmts.updatePassword.run(passwordHash, id);
+  async rename(id, username) {
+    await pool.execute('UPDATE users SET username = ? WHERE user_id = ?', [username, id]);
   },
-
-  /** Removes every login session of this user except the one given. */
-  signOutOtherSessions(id, keepSid) {
-    stmts.deleteOtherSessions.run(id, keepSid);
+  async setPassword(id, hash) {
+    await pool.execute('UPDATE users SET password_hash = ? WHERE user_id = ?', [hash, id]);
   },
-
-  /** Ids of legacy admin accounts (always empty on a fresh install). */
-  legacyAdminIds() {
-    return new Set(stmts.legacyAdminIds ? stmts.legacyAdminIds.all().map((r) => r.user_id) : []);
+  async signOutOtherSessions(id, sid) {
+    await pool.execute('DELETE FROM sessions WHERE user_id = ? AND sid <> ?', [id, sid]);
   },
-
-  /** Active users whose name contains q (empty q lists everyone). Never includes the searcher or legacy admins. */
-  search(meId, q = '', limit = 30) {
-    const query = String(q).trim().slice(0, 50);
-    return stmts.search
-      .all({ me: meId, q: query, pattern: likePattern(query), limit })
-      .map(toPublic);
+  async search(me, query) {
+    const [rows] = await pool.execute(`SELECT * FROM users WHERE user_id <> ? AND status = 'active'
+      AND legacy_admin = 0 AND username LIKE ? ORDER BY username LIMIT 30`, [me, likePattern(query.trim().slice(0, 50))]);
+    return rows.map(toPublic);
   },
-
-  /* ---------------------------------------------------------------- friendships */
-
-  findRequest(id) {
-    return stmts.requestById.get(id) || null;
+  async findRequest(id) {
+    const [rows] = await pool.execute('SELECT * FROM friendships WHERE friendship_id = ?', [id]);
+    return rows[0];
   },
-
-  /** { state: 'none' | 'friends' | 'outgoing' | 'incoming', requestId } */
-  relationBetween(meId, otherId) {
-    return relationFrom(meId, stmts.activeBetween.get({ a: meId, b: otherId }));
+  async relationBetween(me, peer) {
+    const [rows] = await pool.execute('SELECT * FROM friendships WHERE ' + activePair, [me, peer, me, peer]);
+    return relationFrom(me, rows[0]);
   },
-
-  /** THE rule every message send is checked against: an ACCEPTED row for this pair. */
-  areFriends(a, b) {
-    const row = stmts.activeBetween.get({ a, b });
-    return Boolean(row && row.status === 'accepted');
+  async relationsFor(me) {
+    const [rows] = await pool.execute(`SELECT * FROM friendships WHERE
+      (sender_id = ? OR receiver_id = ?) AND status IN ('pending','accepted')`, [me, me]);
+    return new Map(rows.map(row => [row.sender_id === me ? row.receiver_id : row.sender_id, relationFrom(me, row)]));
   },
-
-  /** Map of otherUserId -> relation, for every active relationship the user has. */
-  relationsFor(meId) {
-    const map = new Map();
-    for (const row of stmts.activeFor.all({ me: meId })) {
-      const otherId = row.sender_id === meId ? row.receiver_id : row.sender_id;
-      map.set(otherId, relationFrom(meId, row));
+  async friendsOverview(me) {
+    const [rows] = await pool.execute(`SELECT f.*, u.user_id, u.username, u.status AS account_status
+      FROM friendships f JOIN users u ON u.user_id = IF(f.sender_id = ?, f.receiver_id, f.sender_id)
+      WHERE (f.sender_id = ? OR f.receiver_id = ?)
+        AND (f.status = 'accepted' OR (f.status = 'pending' AND u.status = 'active'))
+      ORDER BY IF(f.status = 'accepted', u.username, NULL), f.friendship_id DESC`, [me, me, me]);
+    const result = { friends: [], incoming: [], outgoing: [] };
+    for (const row of rows) {
+      const list = row.status === 'accepted' ? result.friends : row.sender_id === me ? result.outgoing : result.incoming;
+      list.push(toFriendEntry({...row, status: row.account_status}));
     }
-    return map;
+    return result;
   },
-
-  /** Everything the Friends tab shows: { friends, incoming, outgoing }. */
-  friendsOverview(meId) {
-    return {
-      friends: stmts.friends.all({ me: meId }).map(toFriendEntry),
-      incoming: stmts.incoming.all({ me: meId }).map(toFriendEntry),
-      outgoing: stmts.outgoing.all({ me: meId }).map(toFriendEntry),
-    };
-  },
-
-  /** Returns { ok: true, request } or { ok: false, relation } when the pair already has an active relationship. */
-  sendRequest(senderId, receiverId) {
+  async sendRequest(me, peer) {
     try {
-      return sendRequestTx(senderId, receiverId);
+      const [result] = await pool.execute(`INSERT INTO friendships (sender_id, receiver_id, created_at, updated_at)
+        VALUES (?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`, [me, peer]);
+      return {ok: true, request: await this.findRequest(result.insertId)};
     } catch (err) {
-      // Both people clicked Add Friend at the same instant: the unique index decides.
-      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        return { ok: false, relation: this.relationBetween(senderId, receiverId) };
-      }
-      throw err;
+      if (err.code !== 'ER_DUP_ENTRY') throw err;
+      return {ok: false, relation: await this.relationBetween(me, peer)};
     }
   },
-
-  /** Accept or decline a request addressed to meId. Returns the updated row, or null. */
-  respondToRequest(meId, requestId, accept) {
-    const changed = stmts.respond.run({ id: requestId, me: meId, status: accept ? 'accepted' : 'declined' }).changes;
-    return changed ? stmts.requestById.get(requestId) : null;
+  async respondToRequest(me, id, accept) {
+    const [result] = await pool.execute(`UPDATE friendships SET status = ?, updated_at = UTC_TIMESTAMP()
+      WHERE friendship_id = ? AND receiver_id = ? AND status = 'pending'`, [accept ? 'accepted' : 'declined', id, me]);
+    return result.affectedRows ? this.findRequest(id) : null;
   },
-
-  /** Cancel a pending request that meId sent. Returns the updated row, or null. */
-  cancelRequest(meId, requestId) {
-    const changed = stmts.cancel.run({ id: requestId, me: meId }).changes;
-    return changed ? stmts.requestById.get(requestId) : null;
+  async cancelRequest(me, id) {
+    const [result] = await pool.execute(`UPDATE friendships SET status = 'cancelled', updated_at = UTC_TIMESTAMP()
+      WHERE friendship_id = ? AND sender_id = ? AND status = 'pending'`, [id, me]);
+    return result.affectedRows ? this.findRequest(id) : null;
   },
+  async unfriend(id, me) {
+    const [result] = await pool.execute(`DELETE FROM friendships WHERE friendship_id = ?
+      AND status = 'accepted' AND (sender_id = ? OR receiver_id = ?)`, [id, me, me]);
+    return result.affectedRows;
+  }
 };

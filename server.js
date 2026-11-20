@@ -4,7 +4,7 @@
  *   npm start
  *
  * This file wires everything together, top to bottom:
- *   1. sessions (stored in SQLite)          4. HTTP routes
+ *   1. sessions (stored in MySQL)          4. HTTP routes
  *   2. security headers + CSRF protection    5. 404 / error pages
  *   3. "who is signed in?" + route guards    6. HTTP server + Socket.IO
  */
@@ -17,7 +17,7 @@ const express = require('express');
 const session = require('express-session');
 const { Server } = require('socket.io');
 
-const db = require('./database.js'); // opens SQLite and creates any missing tables
+const db = require('./database.js'); // shared MySQL connection pool
 const userModel = require('./models/userModel');
 const authController = require('./controllers/authController');
 const chatController = require('./controllers/chatController');
@@ -41,7 +41,7 @@ app.locals.formatUtc = (iso) =>
     : '-';
 
 /* ======================================================================
-   1. Sessions, kept server-side in SQLite (table "sessions").
+   1. Sessions, kept server-side in MySQL (table "sessions").
       Only a random, signed session id travels in the cookie.
    ====================================================================== */
 const PLACEHOLDER_SECRETS = ['', 'change-me', 'change-me-to-a-long-random-string'];
@@ -54,75 +54,53 @@ if (PLACEHOLDER_SECRETS.includes(sessionSecret)) {
 }
 const SESSION_MAX_AGE_MS = (Number(process.env.SESSION_DAYS) || 7) * 24 * 60 * 60 * 1000;
 
-class SQLiteSessionStore extends session.Store {
+class MySQLSessionStore extends session.Store {
   constructor() {
     super();
-    this.stmts = {
-      get: db.prepare('SELECT sess FROM sessions WHERE sid = ? AND expires > ?'),
-      set: db.prepare(`
-        INSERT INTO sessions (sid, sess, expires, user_id) VALUES (@sid, @sess, @expires, @userId)
-        ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires, user_id = excluded.user_id
-      `),
-      touch: db.prepare('UPDATE sessions SET expires = ? WHERE sid = ?'),
-      destroy: db.prepare('DELETE FROM sessions WHERE sid = ?'),
-      cleanup: db.prepare('DELETE FROM sessions WHERE expires <= ?'),
-    };
-    // Remove expired sessions every 15 minutes. unref() lets Node exit normally.
-    setInterval(() => this.stmts.cleanup.run(Date.now()), 15 * 60 * 1000).unref();
-    this.stmts.cleanup.run(Date.now());
+    const cleanup = () => db.execute('DELETE FROM sessions WHERE expires <= ?', [Date.now()])
+      .catch(err => console.error('Session cleanup:', err.message));
+    setInterval(cleanup, 15 * 60 * 1000).unref();
   }
 
   expiryOf(sess) {
-    const expires = sess && sess.cookie && sess.cookie.expires;
-    return expires ? new Date(expires).getTime() : Date.now() + SESSION_MAX_AGE_MS;
+    return sess.cookie?.expires ? new Date(sess.cookie.expires).getTime() : Date.now() + SESSION_MAX_AGE_MS;
   }
 
-  get(sid, callback) {
+  async get(sid, callback) {
     try {
-      const row = this.stmts.get.get(sid, Date.now());
-      callback(null, row ? JSON.parse(row.sess) : null);
-    } catch (err) {
-      callback(err);
-    }
+      const [rows] = await db.execute('SELECT sess FROM sessions WHERE sid = ? AND expires > ?', [sid, Date.now()]);
+      callback(null, rows.length ? JSON.parse(rows[0].sess) : null);
+    } catch (err) { callback(err); }
   }
 
-  set(sid, sess, callback) {
+  async set(sid, sess, callback) {
     try {
-      this.stmts.set.run({
-        sid,
-        sess: JSON.stringify(sess),
-        expires: this.expiryOf(sess),
-        userId: Number.isInteger(sess.userId) ? sess.userId : null,
-      });
-      if (callback) callback(null);
-    } catch (err) {
-      if (callback) callback(err);
-    }
+      const data = JSON.stringify(sess), expires = this.expiryOf(sess), user = sess.userId || null;
+      await db.execute(`INSERT INTO sessions (sid, sess, expires, user_id) VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE sess = ?, expires = ?, user_id = ?`, [sid, data, expires, user, data, expires, user]);
+      callback?.(null);
+    } catch (err) { callback?.(err); }
   }
 
-  touch(sid, sess, callback) {
+  async touch(sid, sess, callback) {
     try {
-      this.stmts.touch.run(this.expiryOf(sess), sid);
-      if (callback) callback(null);
-    } catch (err) {
-      if (callback) callback(err);
-    }
+      await db.execute('UPDATE sessions SET expires = ? WHERE sid = ?', [this.expiryOf(sess), sid]);
+      callback?.(null);
+    } catch (err) { callback?.(err); }
   }
 
-  destroy(sid, callback) {
+  async destroy(sid, callback) {
     try {
-      this.stmts.destroy.run(sid);
-      if (callback) callback(null);
-    } catch (err) {
-      if (callback) callback(err);
-    }
+      await db.execute('DELETE FROM sessions WHERE sid = ?', [sid]);
+      callback?.(null);
+    } catch (err) { callback?.(err); }
   }
 }
 
 const sessionMiddleware = session({
   name: 'baiber.sid',
   secret: sessionSecret,
-  store: new SQLiteSessionStore(),
+  store: new MySQLSessionStore(),
   resave: false,
   saveUninitialized: false, // do not create a session until we actually store something in it
   cookie: {
@@ -192,13 +170,13 @@ function csrfProtection(req, res, next) {
    3. Who is signed in? (re-read from the database on EVERY request, so a
       deactivated account loses access immediately) + flash messages + guards
    ====================================================================== */
-function loadUser(req, res, next) {
+async function loadUser(req, res, next) {
   req.user = null;
   res.locals.currentUser = null;
   const userId = req.session && req.session.userId;
   if (!userId) return next();
 
-  const row = userModel.findById(userId);
+  const row = await userModel.findById(userId);
   if (userModel.canUseApp(row)) {
     req.user = userModel.toPublic(row);
     res.locals.currentUser = req.user;
@@ -269,12 +247,22 @@ app.post('/login', guestOnly, authController.login);
 app.get('/register', guestOnly, authController.showRegister);
 app.post('/register', guestOnly, authController.register);
 app.post('/logout', requireAuth, authController.logout); // POST + CSRF token, so no <img> can log you out
+app.post('/api/profile/username', requireAuth, authController.rename);
+app.delete('/api/friends/:id', requireAuth, chatController.unfriend);
 app.post('/api/profile/password', requireAuth, authController.changePassword);
 
 // Chat page and its data
 app.get('/chat', requireAuth, chatController.showChat);
 app.get('/api/me', requireAuth, chatController.me);
 app.get('/api/conversations', requireAuth, chatController.conversations);
+const messageWrites = authController.createLimiter({windowMs: 10000, max: 40});
+function limitMessageWrites(req, res, next) {
+  if (messageWrites.consume(String(req.user.id)).allowed) return next();
+  return res.status(429).json({ok: false, error: 'Too many message changes. Please slow down.'});
+}
+app.post('/api/messages', requireAuth, limitMessageWrites, chatController.createMessage);
+app.put('/api/messages/:id', requireAuth, limitMessageWrites, chatController.editMessage);
+app.delete('/api/messages/:id', requireAuth, limitMessageWrites, chatController.deleteMessage);
 app.get('/api/messages/:peerId', requireAuth, chatController.history);
 
 // Friends
@@ -319,7 +307,8 @@ io.engine.use(sessionMiddleware); // sockets reuse the login session cookie
 app.set('io', io);
 chatController.registerSocketHandlers(io);
 
-function start(port = process.env.PORT || 3000) {
+async function start(port = process.env.PORT || 3000) {
+  await db.execute('SELECT 1 FROM sessions LIMIT 0');
   return new Promise((resolve) => {
     server.listen(port, () => {
       console.log(`Bai-ber is running at http://localhost:${server.address().port}`);
@@ -329,6 +318,10 @@ function start(port = process.env.PORT || 3000) {
 }
 
 // Start only when launched with "node server.js" (tests import this file instead).
-if (require.main === module) start();
+if (require.main === module) start().catch(async err => {
+  console.error('Could not start Bai-ber. Check MySQL, schema.sql and .env.', err.message);
+  await db.end();
+  process.exitCode = 1;
+});
 
 module.exports = { app, server, io, start };

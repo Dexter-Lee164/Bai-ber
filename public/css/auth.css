@@ -61,3 +61,6 @@
   .auth-brand { display: none; }
   .auth-mobile-logo { display: flex; }
 }
+
+.input-icon:has(.is-invalid) + .invalid-feedback,
+.was-validated .input-icon:has(:invalid) + .invalid-feedback { display: block; }

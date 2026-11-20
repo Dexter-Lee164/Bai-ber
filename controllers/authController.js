@@ -108,7 +108,7 @@ module.exports = {
       }
 
       // Legacy admin accounts (older databases only) are treated exactly like an unknown username.
-      const found = userModel.findByUsername(username);
+      const found = await userModel.findByUsername(username);
       const user = found && !userModel.isLegacyAdmin(found) ? found : null;
       const passwordOk = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
 
@@ -160,7 +160,7 @@ module.exports = {
       const errors = {};
       const usernameError = userModel.validateUsername(username);
       if (usernameError) errors.username = usernameError;
-      else if (userModel.findByUsername(username)) errors.username = 'That username is already taken.';
+      else if (await userModel.findByUsername(username)) errors.username = 'This username is already in use.';
 
       const passwordError = userModel.validatePassword(password);
       if (passwordError) errors.password = passwordError;
@@ -172,11 +172,11 @@ module.exports = {
 
       const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
       try {
-        userModel.create({ username, passwordHash });
+        await userModel.create({ username, passwordHash });
       } catch (err) {
         // Two people registering the same name at the same moment: the UNIQUE constraint decides.
-        if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-          return show(400, { username: 'That username is already taken.' });
+        if (err.code === 'ER_DUP_ENTRY') {
+          return show(400, { username: 'This username is already in use.' });
         }
         throw err;
       }
@@ -186,6 +186,21 @@ module.exports = {
     } catch (err) {
       return next(err);
     }
+  },
+
+  async rename(req, res) {
+    const username = text(req.body?.username).trim();
+    if (username === req.user.username) return res.json({ ok: true, username });
+    const error = userModel.validateUsername(username);
+    if (error) return res.status(400).json({ ok: false, error });
+    try {
+      await userModel.rename(req.user.id, username);
+    } catch (err) {
+      if (err.code !== 'ER_DUP_ENTRY') throw err;
+      return res.status(409).json({ ok: false, error: 'This username is already in use.' });
+    }
+    req.app.get('io').emit('profile:renamed', { id: req.user.id, username });
+    return res.json({ ok: true, username });
   },
 
   logout(req, res) {
@@ -209,7 +224,7 @@ module.exports = {
         return res.status(429).json({ ok: false, error: 'Too many attempts. Please try again later.' });
       }
 
-      const row = userModel.findById(req.user.id);
+      const row = await userModel.findById(req.user.id);
       const currentOk = currentPassword && (await bcrypt.compare(currentPassword, row.password_hash));
       if (!currentOk) {
         passwordByUser.consume(limiterKey);
@@ -223,11 +238,11 @@ module.exports = {
       if (!errors.newPassword && newPassword !== confirmPassword) errors.confirmPassword = 'Passwords do not match.';
       if (Object.keys(errors).length) return res.status(400).json({ ok: false, errors });
 
-      userModel.setPassword(req.user.id, await bcrypt.hash(newPassword, BCRYPT_ROUNDS));
+      await userModel.setPassword(req.user.id, await bcrypt.hash(newPassword, BCRYPT_ROUNDS));
       passwordByUser.reset(limiterKey);
 
       // Sign out every OTHER device, keep this one.
-      userModel.signOutOtherSessions(req.user.id, req.sessionID);
+      await userModel.signOutOtherSessions(req.user.id, req.sessionID);
       disconnectSockets(req, (socket) => socket.data.userId === req.user.id && socket.data.sid !== req.sessionID);
 
       return res.json({ ok: true, message: 'Password updated. Other devices were signed out.' });
